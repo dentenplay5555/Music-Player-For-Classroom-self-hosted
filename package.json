@@ -1,0 +1,21 @@
+{
+  "name": "qr-music",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "workers/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n \"worker,web\" -c \"cyan,magenta\" \"npm run dev -w @qr-music/api\" \"npm run dev -w @qr-music/web\"",
+    "build": "npm run build -w @qr-music/shared && npm run build -w @qr-music/api && npm run build -w @qr-music/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "d1:migrate:local": "wrangler d1 migrations apply qr-music-db --local -c workers/api/wrangler.toml",
+    "d1:migrate:remote": "wrangler d1 migrations apply qr-music-db --remote -c workers/api/wrangler.toml"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  }
+}

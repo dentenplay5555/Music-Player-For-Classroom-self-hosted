@@ -1,0 +1,25 @@
+name = "qr-music-api"
+main = "src/index.ts"
+compatibility_date = "2026-10-22"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ADMIN_PASSWORD = "TM-OPERA_O"
+PUBLIC_URL = "http://192.168.1.143:5173"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "qr-music-db"
+database_id = "local-qr-music-db-id"
+migrations_dir = "../../migrations"
+
+[[durable_objects.bindings]]
+name = "ROOM_COORDINATOR"
+class_name = "RoomCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RoomCoordinator"]
