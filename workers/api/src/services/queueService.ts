@@ -10,6 +10,33 @@ import {
   AdminRoomDetail,
   RATE_LIMITS,
 } from '@qr-music/shared';
+import { sha256 } from './crypto';
+
+// Retry helper for concurrent database transaction conflicts
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (
+        msg.includes('UNIQUE') ||
+        msg.includes('constraint') ||
+        msg.includes('busy') ||
+        msg.includes('locked') ||
+        msg.includes('conflict')
+      ) {
+        // Exponential jitter backoff (25ms - 80ms)
+        await new Promise((r) => setTimeout(r, 25 + Math.random() * 55));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
 
 export function parseRoomSettings(settingsJson?: string): RoomSettings {
   try {
@@ -18,13 +45,19 @@ export function parseRoomSettings(settingsJson?: string): RoomSettings {
     }
     const parsed = JSON.parse(settingsJson);
     return {
-      maxQueue: typeof parsed.maxQueue === 'number' ? parsed.maxQueue : 100,
+      maxQueue: typeof parsed.maxQueue === 'number' && parsed.maxQueue > 0 ? parsed.maxQueue : 100,
       allowDuplicates: Boolean(parsed.allowDuplicates),
-      cooldownSeconds: typeof parsed.cooldownSeconds === 'number' ? parsed.cooldownSeconds : 5,
+      cooldownSeconds: typeof parsed.cooldownSeconds === 'number' && parsed.cooldownSeconds >= 0 ? parsed.cooldownSeconds : 5,
     };
   } catch {
     return { maxQueue: 100, allowDuplicates: false, cooldownSeconds: 5 };
   }
+}
+
+// Strip internal security token hashes from public song response
+function sanitizeSong(s: Song): Song {
+  const { request_token_hash, ...rest } = s;
+  return rest;
 }
 
 // Helper to broadcast event to a room's Durable Object
@@ -98,8 +131,8 @@ export async function getQueueSnapshot(
 
   return {
     room,
-    playing: playing ?? null,
-    queue: queueResult.results ?? [],
+    playing: playing ? sanitizeSong(playing) : null,
+    queue: (queueResult.results ?? []).map(sanitizeSong),
     queueVersion: room.queue_version,
     publicUrl,
     playerOnline: isPlayerOnline,
@@ -114,118 +147,127 @@ export async function addSongToQueue(
   title: string | null,
   requestId: string
 ): Promise<{ song: Song; queueVersion: number; position: number }> {
-  const db = env.DB;
-  const room = await getRoomByCode(db, roomCode);
-  if (!room) {
-    throw new Error('ROOM_NOT_FOUND: ห้องนี้ไม่มีอยู่ในระบบ');
-  }
+  // Validate requestId
+  const validRequestId =
+    typeof requestId === 'string' && requestId.trim().length > 0 && requestId.trim().length <= 64
+      ? requestId.trim()
+      : crypto.randomUUID();
 
-  if (room.status !== 'open') {
-    throw new Error('ROOM_CLOSED: ขณะนี้ห้องปิดรับคำขอเพลงแล้ว');
-  }
+  const tokenHash = await sha256(validRequestId);
 
-  const settings = parseRoomSettings(room.settings_json);
-
-  // Check queue length cap from settings
-  const countResult = await db
-    .prepare("SELECT COUNT(*) as count FROM songs WHERE room_id = ? AND status = 'queued'")
-    .bind(room.id)
-    .first<{ count: number }>();
-
-  if ((countResult?.count ?? 0) >= settings.maxQueue) {
-    throw new Error(`QUEUE_FULL: ขณะนี้คิวเพลงเต็มแล้ว (จำกัดสูงสุด ${settings.maxQueue} เพลง)`);
-  }
-
-  // Check duplicate in current queue if disallowed
-  if (!settings.allowDuplicates) {
-    const duplicate = await db
-      .prepare("SELECT id FROM songs WHERE room_id = ? AND video_id = ? AND status = 'queued' LIMIT 1")
-      .bind(room.id, videoId)
-      .first();
-
-    if (duplicate) {
-      throw new Error('DUPLICATE_SONG: เพลงนี้อยู่ในคิวเรียบร้อยแล้ว');
+  // Wrap in withRetry to prevent version collision on concurrent song additions
+  return await withRetry(async () => {
+    const db = env.DB;
+    const room = await getRoomByCode(db, roomCode);
+    if (!room) {
+      throw new Error('ROOM_NOT_FOUND: ห้องนี้ไม่มีอยู่ในระบบ');
     }
-  }
 
-  // Determine next position
-  const maxPosResult = await db
-    .prepare("SELECT COALESCE(MAX(position), 0) as max_pos FROM songs WHERE room_id = ? AND status = 'queued'")
-    .bind(room.id)
-    .first<{ max_pos: number }>();
-  const nextPosition = (maxPosResult?.max_pos ?? 0) + 1;
+    if (room.status !== 'open') {
+      throw new Error('ROOM_CLOSED: ขณะนี้ห้องปิดรับคำขอเพลงแล้ว');
+    }
 
-  const now = new Date().toISOString();
-  const songId = crypto.randomUUID();
-  const nextVersion = room.queue_version + 1;
+    const settings = parseRoomSettings(room.settings_json);
 
-  // Execute in D1 batch (atomic transaction)
-  await db.batch([
-    // 1. Insert song
-    db.prepare(`
-      INSERT INTO songs (id, room_id, video_id, title, status, position, request_token_hash, created_at)
-      VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
-    `).bind(songId, room.id, videoId, title, nextPosition, requestId, now),
+    // Check queue length cap from settings
+    const countResult = await db
+      .prepare("SELECT COUNT(*) as count FROM songs WHERE room_id = ? AND status = 'queued'")
+      .bind(room.id)
+      .first<{ count: number }>();
 
-    // 2. Update room version
-    db.prepare(`
-      UPDATE rooms
-      SET queue_version = ?, updated_at = ?
-      WHERE id = ?
-    `).bind(nextVersion, now, room.id),
+    if ((countResult?.count ?? 0) >= settings.maxQueue) {
+      throw new Error(`QUEUE_FULL: ขณะนี้คิวเพลงเต็มแล้ว (จำกัดสูงสุด ${settings.maxQueue} เพลง)`);
+    }
 
-    // 3. Log event
-    db.prepare(`
-      INSERT INTO room_events (room_id, version, event_type, payload_json, created_at)
-      VALUES (?, ?, 'song.added', ?, ?)
-    `).bind(
-      room.id,
-      nextVersion,
-      JSON.stringify({ songId, videoId, title, position: nextPosition }),
-      now
-    ),
-  ]);
+    // Check duplicate in current queue if disallowed
+    if (!settings.allowDuplicates) {
+      const duplicate = await db
+        .prepare("SELECT id FROM songs WHERE room_id = ? AND video_id = ? AND status = 'queued' LIMIT 1")
+        .bind(room.id, videoId)
+        .first();
 
-  const newSong: Song = {
-    id: songId,
-    room_id: room.id,
-    video_id: videoId,
-    title,
-    status: 'queued',
-    position: nextPosition,
-    request_token_hash: requestId,
-    created_at: now,
-  };
+      if (duplicate) {
+        throw new Error('DUPLICATE_SONG: เพลงนี้อยู่ในคิวเรียบร้อยแล้ว');
+      }
+    }
 
-  // Broadcast to all connected clients
-  await broadcastToRoom(env, room.code, {
-    type: 'song.added',
-    roomCode: room.code,
-    version: nextVersion,
-    payload: { song: newSong, queueVersion: nextVersion },
-  });
+    // Determine next position
+    const maxPosResult = await db
+      .prepare("SELECT COALESCE(MAX(position), 0) as max_pos FROM songs WHERE room_id = ? AND status = 'queued'")
+      .bind(room.id)
+      .first<{ max_pos: number }>();
+    const nextPosition = (maxPosResult?.max_pos ?? 0) + 1;
 
-  // Also broadcast full queue snapshot
-  const snapshot = await getQueueSnapshot(db, room.code);
-  if (snapshot) {
+    const now = new Date().toISOString();
+    const songId = crypto.randomUUID();
+    const nextVersion = room.queue_version + 1;
+
+    // Execute in D1 batch (atomic transaction)
+    await db.batch([
+      // 1. Insert song with hashed request token
+      db.prepare(`
+        INSERT INTO songs (id, room_id, video_id, title, status, position, request_token_hash, created_at)
+        VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+      `).bind(songId, room.id, videoId, title, nextPosition, tokenHash, now),
+
+      // 2. Update room version
+      db.prepare(`
+        UPDATE rooms
+        SET queue_version = ?, updated_at = ?
+        WHERE id = ?
+      `).bind(nextVersion, now, room.id),
+
+      // 3. Log event
+      db.prepare(`
+        INSERT INTO room_events (room_id, version, event_type, payload_json, created_at)
+        VALUES (?, ?, 'song.added', ?, ?)
+      `).bind(
+        room.id,
+        nextVersion,
+        JSON.stringify({ songId, videoId, title, position: nextPosition }),
+        now
+      ),
+    ]);
+
+    const newSong: Song = {
+      id: songId,
+      room_id: room.id,
+      video_id: videoId,
+      title,
+      status: 'queued',
+      position: nextPosition,
+      created_at: now,
+    };
+
+    // Broadcast to all connected clients
     await broadcastToRoom(env, room.code, {
-      type: 'queue.updated',
+      type: 'song.added',
       roomCode: room.code,
       version: nextVersion,
-      payload: {
-        addedSongId: songId,
-        position: nextPosition,
-        playing: snapshot.playing,
-        queue: snapshot.queue,
-      },
+      payload: { song: sanitizeSong(newSong), queueVersion: nextVersion },
     });
-  }
 
-  return {
-    song: newSong,
-    queueVersion: nextVersion,
-    position: nextPosition,
-  };
+    const snapshot = await getQueueSnapshot(db, room.code);
+    if (snapshot) {
+      await broadcastToRoom(env, room.code, {
+        type: 'queue.updated',
+        roomCode: room.code,
+        version: nextVersion,
+        payload: {
+          addedSongId: songId,
+          position: nextPosition,
+          playing: snapshot.playing,
+          queue: snapshot.queue,
+        },
+      });
+    }
+
+    return {
+      song: sanitizeSong(newSong),
+      queueVersion: nextVersion,
+      position: nextPosition,
+    };
+  });
 }
 
 export async function advanceQueue(
@@ -233,122 +275,124 @@ export async function advanceQueue(
   roomId: string,
   reason: 'finished' | 'skipped'
 ): Promise<{ previousSong: Song | null; nextSong: Song | null; queueVersion: number }> {
-  const db = env.DB;
-  const room = await getRoomById(db, roomId);
-  if (!room) {
-    throw new Error('ROOM_NOT_FOUND');
-  }
+  return await withRetry(async () => {
+    const db = env.DB;
+    const room = await getRoomById(db, roomId);
+    if (!room) {
+      throw new Error('ROOM_NOT_FOUND');
+    }
 
-  const now = new Date().toISOString();
+    const now = new Date().toISOString();
 
-  // Find currently playing song
-  const currentPlaying = await db
-    .prepare("SELECT * FROM songs WHERE room_id = ? AND status = 'playing' LIMIT 1")
-    .bind(roomId)
-    .first<Song>();
+    // Find currently playing song
+    const currentPlaying = await db
+      .prepare("SELECT * FROM songs WHERE room_id = ? AND status = 'playing' LIMIT 1")
+      .bind(roomId)
+      .first<Song>();
 
-  // Find next queued song
-  const nextQueued = await db
-    .prepare("SELECT * FROM songs WHERE room_id = ? AND status = 'queued' ORDER BY position ASC LIMIT 1")
-    .bind(roomId)
-    .first<Song>();
+    // Find next queued song
+    const nextQueued = await db
+      .prepare("SELECT * FROM songs WHERE room_id = ? AND status = 'queued' ORDER BY position ASC LIMIT 1")
+      .bind(roomId)
+      .first<Song>();
 
-  const nextVersion = room.queue_version + 1;
-  const statements: D1PreparedStatement[] = [];
+    const nextVersion = room.queue_version + 1;
+    const statements: D1PreparedStatement[] = [];
 
-  // Update currently playing song if exists
-  if (currentPlaying) {
-    const statusToSet = reason === 'skipped' ? 'skipped' : 'played';
+    // Update currently playing song if exists
+    if (currentPlaying) {
+      const statusToSet = reason === 'skipped' ? 'skipped' : 'played';
+      statements.push(
+        db.prepare(`
+          UPDATE songs
+          SET status = ?, finished_at = ?
+          WHERE id = ?
+        `).bind(statusToSet, now, currentPlaying.id)
+      );
+    }
+
+    // Update next song to playing if exists
+    if (nextQueued) {
+      statements.push(
+        db.prepare(`
+          UPDATE songs
+          SET status = 'playing', started_at = ?, position = 0
+          WHERE id = ?
+        `).bind(now, nextQueued.id)
+      );
+    }
+
+    // Update room version
     statements.push(
       db.prepare(`
-        UPDATE songs
-        SET status = ?, finished_at = ?
+        UPDATE rooms
+        SET queue_version = ?, updated_at = ?
         WHERE id = ?
-      `).bind(statusToSet, now, currentPlaying.id)
+      `).bind(nextVersion, now, roomId)
     );
-  }
 
-  // Update next song to playing if exists
-  if (nextQueued) {
+    // Log room event
+    const eventType = reason === 'skipped' ? 'song.skipped' : 'song.finished';
     statements.push(
       db.prepare(`
-        UPDATE songs
-        SET status = 'playing', started_at = ?, position = 0
-        WHERE id = ?
-      `).bind(now, nextQueued.id)
+        INSERT INTO room_events (room_id, version, event_type, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(
+        roomId,
+        nextVersion,
+        eventType,
+        JSON.stringify({
+          previousSongId: currentPlaying?.id ?? null,
+          nextSongId: nextQueued?.id ?? null,
+        }),
+        now
+      )
     );
-  }
 
-  // Update room version
-  statements.push(
-    db.prepare(`
-      UPDATE rooms
-      SET queue_version = ?, updated_at = ?
-      WHERE id = ?
-    `).bind(nextVersion, now, roomId)
-  );
+    await db.batch(statements);
 
-  // Log room event
-  const eventType = reason === 'skipped' ? 'song.skipped' : 'song.finished';
-  statements.push(
-    db.prepare(`
-      INSERT INTO room_events (room_id, version, event_type, payload_json, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(
-      roomId,
-      nextVersion,
-      eventType,
-      JSON.stringify({
-        previousSongId: currentPlaying?.id ?? null,
-        nextSongId: nextQueued?.id ?? null,
-      }),
-      now
-    )
-  );
+    const updatedNextSong: Song | null = nextQueued
+      ? { ...nextQueued, status: 'playing', started_at: now, position: 0 }
+      : null;
 
-  await db.batch(statements);
+    // Broadcast updates
+    if (reason === 'skipped' && currentPlaying) {
+      await broadcastToRoom(env, room.code, {
+        type: 'song.skipped',
+        roomCode: room.code,
+        version: nextVersion,
+        payload: { songId: currentPlaying.id, queueVersion: nextVersion },
+      });
+    }
 
-  const updatedNextSong: Song | null = nextQueued
-    ? { ...nextQueued, status: 'playing', started_at: now, position: 0 }
-    : null;
+    if (updatedNextSong) {
+      await broadcastToRoom(env, room.code, {
+        type: 'song.started',
+        roomCode: room.code,
+        version: nextVersion,
+        payload: { song: sanitizeSong(updatedNextSong), queueVersion: nextVersion },
+      });
+    }
 
-  // Broadcast updates
-  if (reason === 'skipped' && currentPlaying) {
-    await broadcastToRoom(env, room.code, {
-      type: 'song.skipped',
-      roomCode: room.code,
-      version: nextVersion,
-      payload: { songId: currentPlaying.id, queueVersion: nextVersion },
-    });
-  }
+    const snapshot = await getQueueSnapshot(db, room.code);
+    if (snapshot) {
+      await broadcastToRoom(env, room.code, {
+        type: 'queue.updated',
+        roomCode: room.code,
+        version: nextVersion,
+        payload: {
+          playing: snapshot.playing,
+          queue: snapshot.queue,
+        },
+      });
+    }
 
-  if (updatedNextSong) {
-    await broadcastToRoom(env, room.code, {
-      type: 'song.started',
-      roomCode: room.code,
-      version: nextVersion,
-      payload: { song: updatedNextSong, queueVersion: nextVersion },
-    });
-  }
-
-  const snapshot = await getQueueSnapshot(db, room.code);
-  if (snapshot) {
-    await broadcastToRoom(env, room.code, {
-      type: 'queue.updated',
-      roomCode: room.code,
-      version: nextVersion,
-      payload: {
-        playing: snapshot.playing,
-        queue: snapshot.queue,
-      },
-    });
-  }
-
-  return {
-    previousSong: currentPlaying ?? null,
-    nextSong: updatedNextSong,
-    queueVersion: nextVersion,
-  };
+    return {
+      previousSong: currentPlaying ? sanitizeSong(currentPlaying) : null,
+      nextSong: updatedNextSong ? sanitizeSong(updatedNextSong) : null,
+      queueVersion: nextVersion,
+    };
+  });
 }
 
 export async function reorderSong(
@@ -357,63 +401,63 @@ export async function reorderSong(
   songId: string,
   direction: 'up' | 'down'
 ): Promise<void> {
-  const db = env.DB;
-  const room = await getRoomById(db, roomId);
-  if (!room) throw new Error('ROOM_NOT_FOUND');
+  return await withRetry(async () => {
+    const db = env.DB;
+    const room = await getRoomById(db, roomId);
+    if (!room) throw new Error('ROOM_NOT_FOUND');
 
-  // Fetch all queued songs
-  const queueResult = await db
-    .prepare("SELECT * FROM songs WHERE room_id = ? AND status = 'queued' ORDER BY position ASC")
-    .bind(roomId)
-    .all<Song>();
+    const queueResult = await db
+      .prepare("SELECT * FROM songs WHERE room_id = ? AND status = 'queued' ORDER BY position ASC")
+      .bind(roomId)
+      .all<Song>();
 
-  const queue = queueResult.results ?? [];
-  const index = queue.findIndex((s) => s.id === songId);
-  if (index === -1) throw new Error('SONG_NOT_IN_QUEUE');
+    const queue = queueResult.results ?? [];
+    const index = queue.findIndex((s) => s.id === songId);
+    if (index === -1) throw new Error('SONG_NOT_IN_QUEUE');
 
-  const targetIndex = direction === 'up' ? index - 1 : index + 1;
-  if (targetIndex < 0 || targetIndex >= queue.length) {
-    return; // Already at the boundary
-  }
+    const targetIndex = direction === 'up' ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= queue.length) {
+      return;
+    }
 
-  const currentSong = queue[index];
-  const adjacentSong = queue[targetIndex];
+    const currentSong = queue[index];
+    const adjacentSong = queue[targetIndex];
 
-  const now = new Date().toISOString();
-  const nextVersion = room.queue_version + 1;
+    const now = new Date().toISOString();
+    const nextVersion = room.queue_version + 1;
 
-  // Swap positions atomically
-  await db.batch([
-    db.prepare('UPDATE songs SET position = ? WHERE id = ?').bind(adjacentSong.position, currentSong.id),
-    db.prepare('UPDATE songs SET position = ? WHERE id = ?').bind(currentSong.position, adjacentSong.id),
-    db.prepare('UPDATE rooms SET queue_version = ?, updated_at = ? WHERE id = ?').bind(nextVersion, now, roomId),
-    db.prepare(`
-      INSERT INTO room_events (room_id, version, event_type, payload_json, created_at)
-      VALUES (?, ?, 'song.reordered', ?, ?)
-    `).bind(
-      roomId,
-      nextVersion,
-      JSON.stringify({
-        songId: currentSong.id,
-        direction,
-        swappedWithSongId: adjacentSong.id,
-      }),
-      now
-    ),
-  ]);
+    await db.batch([
+      db.prepare('UPDATE songs SET position = ? WHERE id = ?').bind(adjacentSong.position, currentSong.id),
+      db.prepare('UPDATE songs SET position = ? WHERE id = ?').bind(currentSong.position, adjacentSong.id),
+      db.prepare('UPDATE rooms SET queue_version = ?, updated_at = ? WHERE id = ?').bind(nextVersion, now, roomId),
+      db.prepare(`
+        INSERT INTO room_events (room_id, version, event_type, payload_json, created_at)
+        VALUES (?, ?, 'song.reordered', ?, ?)
+      `).bind(
+        roomId,
+        nextVersion,
+        JSON.stringify({
+          songId: currentSong.id,
+          direction,
+          swappedWithSongId: adjacentSong.id,
+        }),
+        now
+      ),
+    ]);
 
-  const snapshot = await getQueueSnapshot(db, room.code);
-  if (snapshot) {
-    await broadcastToRoom(env, room.code, {
-      type: 'queue.updated',
-      roomCode: room.code,
-      version: nextVersion,
-      payload: {
-        playing: snapshot.playing,
-        queue: snapshot.queue,
-      },
-    });
-  }
+    const snapshot = await getQueueSnapshot(db, room.code);
+    if (snapshot) {
+      await broadcastToRoom(env, room.code, {
+        type: 'queue.updated',
+        roomCode: room.code,
+        version: nextVersion,
+        payload: {
+          playing: snapshot.playing,
+          queue: snapshot.queue,
+        },
+      });
+    }
+  });
 }
 
 export async function removeSongFromQueue(
@@ -424,6 +468,20 @@ export async function removeSongFromQueue(
   const db = env.DB;
   const room = await getRoomById(db, roomId);
   if (!room) throw new Error('ROOM_NOT_FOUND');
+
+  // Check if this song is the one currently playing!
+  const targetSong = await db
+    .prepare('SELECT status FROM songs WHERE id = ? AND room_id = ?')
+    .bind(songId, roomId)
+    .first<{ status: string }>();
+
+  if (!targetSong) throw new Error('SONG_NOT_FOUND');
+
+  // If removing the currently playing song, advance queue immediately!
+  if (targetSong.status === 'playing') {
+    await advanceQueue(env, roomId, 'skipped');
+    return;
+  }
 
   const now = new Date().toISOString();
   const nextVersion = room.queue_version + 1;
@@ -512,12 +570,41 @@ export async function updateRoomSettings(
   if (!room) throw new Error('ROOM_NOT_FOUND');
 
   const current = parseRoomSettings(room.settings_json);
-  const updated: RoomSettings = {
-    ...current,
-    ...newSettings,
+  const updated: RoomSettings = { ...current };
+
+  // Validate settings ranges and types
+  if (newSettings.maxQueue !== undefined) {
+    const mq = Math.floor(newSettings.maxQueue);
+    if (isNaN(mq) || mq < 1 || mq > 500) {
+      throw new Error('INVALID_SETTINGS: maxQueue ต้องเป็นจำนวนเต็มระหว่าง 1 ถึง 500');
+    }
+    updated.maxQueue = mq;
+  }
+
+  if (newSettings.cooldownSeconds !== undefined) {
+    const cd = Math.floor(newSettings.cooldownSeconds);
+    if (isNaN(cd) || cd < 0 || cd > 300) {
+      throw new Error('INVALID_SETTINGS: cooldownSeconds ต้องเป็นจำนวนเต็มระหว่าง 0 ถึง 300');
+    }
+    updated.cooldownSeconds = cd;
+  }
+
+  if (newSettings.allowDuplicates !== undefined) {
+    updated.allowDuplicates = Boolean(newSettings.allowDuplicates);
+  }
+
+  // Preserve playerToken if present in existing settings_json
+  let existingSettingsObj: any = {};
+  try {
+    existingSettingsObj = JSON.parse(room.settings_json || '{}');
+  } catch {}
+
+  const merged = {
+    ...existingSettingsObj,
+    ...updated,
   };
 
-  const jsonStr = JSON.stringify(updated);
+  const jsonStr = JSON.stringify(merged);
   const now = new Date().toISOString();
 
   await db.prepare('UPDATE rooms SET settings_json = ?, updated_at = ? WHERE id = ?').bind(jsonStr, now, roomId).run();
@@ -590,7 +677,6 @@ export async function getDashboardStats(db: Env['DB']): Promise<DashboardStats> 
     .prepare("SELECT COUNT(*) as count FROM songs WHERE status = 'queued'")
     .first<{ count: number }>();
 
-  // Count players active within last 45 seconds
   const sessions = await db
     .prepare('SELECT last_seen_at FROM player_sessions')
     .all<{ last_seen_at: string }>();
@@ -603,7 +689,6 @@ export async function getDashboardStats(db: Env['DB']): Promise<DashboardStats> 
     }
   }
 
-  // Requests created today
   const todayResult = await db
     .prepare("SELECT COUNT(*) as count FROM songs WHERE date(created_at) = date('now')")
     .first<{ count: number }>();
@@ -662,9 +747,9 @@ export async function getRoomFullDetails(
   return {
     room,
     settings,
-    playing: playing ?? null,
-    queue: queue.results ?? [],
-    history: history.results ?? [],
+    playing: playing ? sanitizeSong(playing) : null,
+    queue: (queue.results ?? []).map(sanitizeSong),
+    history: (history.results ?? []).map(sanitizeSong),
     events: events.results ?? [],
     playerOnline: isPlayerOnline,
     playerStatus: session?.status || 'offline',

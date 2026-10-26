@@ -9,6 +9,7 @@ import {
 } from '../services/queueService';
 import { extractVideoId, fetchYouTubeTitle } from '../services/youtube';
 import { AddSongRequest } from '@qr-music/shared';
+import { playerAuthMiddleware } from '../middleware/auth';
 
 export const publicRoutes = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -93,6 +94,13 @@ publicRoutes.post('/rooms/:code/songs', async (c) => {
     );
   }
 
+  // Validate and truncate requestId to prevent DB injection / oversized values
+  const rawReqId = body.requestId;
+  const safeRequestId =
+    typeof rawReqId === 'string' && rawReqId.trim().length > 0 && rawReqId.trim().length <= 64
+      ? rawReqId.trim()
+      : requestId;
+
   const videoId = extractVideoId(body.youtubeUrl);
   if (!videoId) {
     return c.json(
@@ -108,7 +116,6 @@ publicRoutes.post('/rooms/:code/songs', async (c) => {
     );
   }
 
-  // Fetch title asynchronously
   const title = await fetchYouTubeTitle(videoId);
 
   try {
@@ -117,7 +124,7 @@ publicRoutes.post('/rooms/:code/songs', async (c) => {
       code,
       videoId,
       title,
-      body.requestId || requestId
+      safeRequestId
     );
 
     return c.json(
@@ -179,8 +186,9 @@ publicRoutes.get('/rooms/:code/events', async (c) => {
   });
 });
 
-// 5. Player reports song ended or requests next song
-publicRoutes.post('/rooms/:code/player/next', async (c) => {
+// 5. Player reports song ended / requests next song
+//    Requires player token — prevents spectators from spamming skip via QR code
+publicRoutes.post('/rooms/:code/player/next', playerAuthMiddleware, async (c) => {
   const code = c.req.param('code');
   const requestId = c.get('requestId');
   const room = await getRoomByCode(c.env.DB, code);
@@ -204,16 +212,18 @@ publicRoutes.post('/rooms/:code/player/next', async (c) => {
   });
 });
 
-// 5.1 Player Heartbeat
-publicRoutes.post('/rooms/:code/player/heartbeat', async (c) => {
+// 5.1 Player Heartbeat — requires player token
+publicRoutes.post('/rooms/:code/player/heartbeat', playerAuthMiddleware, async (c) => {
   const code = c.req.param('code');
   const requestId = c.get('requestId');
   let status = 'idle';
   try {
     const body = await c.req.json<{ status?: string }>();
-    if (body.status) status = body.status;
+    if (body.status && typeof body.status === 'string' && body.status.length <= 32) {
+      status = body.status;
+    }
   } catch {
-    // ignore
+    // ignore malformed body, use default status
   }
 
   await recordPlayerHeartbeat(c.env, code, status);

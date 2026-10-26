@@ -3,8 +3,6 @@ import { Env } from '../types';
 import { ServerToClientMessage, ClientToServerMessage } from '@qr-music/shared';
 
 export class RoomCoordinator extends DurableObject<Env> {
-  private roomCode: string | null = null;
-
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -14,12 +12,10 @@ export class RoomCoordinator extends DurableObject<Env> {
       const [client, server] = Object.values(pair);
 
       const roomCode = url.searchParams.get('roomCode') || 'unknown';
-      this.roomCode = roomCode;
 
-      // Accept the WebSocket into Durable Object Hibernation
+      // Accept into hibernation — tag with roomCode so we can retrieve it after wake-up
       this.ctx.acceptWebSocket(server, [roomCode]);
 
-      // Return client side of the pair
       return new Response(null, {
         status: 101,
         webSocket: client,
@@ -31,9 +27,10 @@ export class RoomCoordinator extends DurableObject<Env> {
       try {
         const body = (await request.json()) as ServerToClientMessage;
         this.broadcast(body);
-        return new Response(JSON.stringify({ ok: true, recipients: this.ctx.getWebSockets().length }), {
-          headers: { 'Content-Type': 'application/json' },
-        });
+        return new Response(
+          JSON.stringify({ ok: true, recipients: this.ctx.getWebSockets().length }),
+          { headers: { 'Content-Type': 'application/json' } }
+        );
       } catch (err: unknown) {
         return new Response(
           JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }),
@@ -42,12 +39,14 @@ export class RoomCoordinator extends DurableObject<Env> {
       }
     }
 
-    // 3. Status check
+    // 3. Status check — retrieve roomCode safely from first connected WebSocket tag
     if (url.pathname === '/stats') {
+      const sockets = this.ctx.getWebSockets();
+      const roomCode = sockets.length > 0 ? (this.ctx.getTags(sockets[0])[0] ?? null) : null;
       return new Response(
         JSON.stringify({
-          activeConnections: this.ctx.getWebSockets().length,
-          roomCode: this.roomCode,
+          activeConnections: sockets.length,
+          roomCode,
         }),
         { headers: { 'Content-Type': 'application/json' } }
       );
@@ -57,6 +56,8 @@ export class RoomCoordinator extends DurableObject<Env> {
   }
 
   // WebSocket Hibernation: message handler
+  // NOTE: Instance variables are NOT available after hibernation wakeup.
+  // Always retrieve roomCode from ctx.getTags(ws)[0].
   webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
     if (typeof message !== 'string') return;
 
@@ -64,11 +65,12 @@ export class RoomCoordinator extends DurableObject<Env> {
       const data = JSON.parse(message) as ClientToServerMessage;
 
       if (data.type === 'client.hello') {
-        // Acknowledge client connection
+        // Retrieve roomCode from tag (safe after hibernation)
+        const roomCode = this.ctx.getTags(ws)[0] ?? '';
         ws.send(
           JSON.stringify({
             type: 'player.status',
-            roomCode: this.roomCode || '',
+            roomCode,
             version: data.lastSeenVersion,
             payload: { status: 'connected', timestamp: new Date().toISOString() },
           })
@@ -79,19 +81,29 @@ export class RoomCoordinator extends DurableObject<Env> {
     }
   }
 
-  webSocketClose(ws: WebSocket, code: number, reason: string): void {
-    ws.close(code, 'Durable Object closed connection');
+  webSocketClose(ws: WebSocket, code: number, _reason: string): void {
+    // Codes 1005 and 1006 must NOT be sent by application code — they are reserved.
+    // Using them in ws.close() throws a runtime error.
+    const safeCode = code === 1005 || code === 1006 ? 1000 : code;
+    try {
+      ws.close(safeCode, 'Connection closed');
+    } catch {
+      // Socket may already be closed
+    }
   }
 
-  webSocketError(ws: WebSocket, error: unknown): void {
-    ws.close(1011, 'WebSocket error occurred');
+  webSocketError(ws: WebSocket, _error: unknown): void {
+    try {
+      ws.close(1011, 'WebSocket error occurred');
+    } catch {
+      // Socket may already be closed
+    }
   }
 
   // Broadcast helper to send to all connected clients in this room
   broadcast(message: ServerToClientMessage): void {
     const payload = JSON.stringify(message);
-    const sockets = this.ctx.getWebSockets();
-    for (const ws of sockets) {
+    for (const ws of this.ctx.getWebSockets()) {
       try {
         ws.send(payload);
       } catch {

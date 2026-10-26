@@ -22,50 +22,63 @@ import {
   PlayerCommandRequest,
   RoomSettings,
 } from '@qr-music/shared';
+import { signAdminToken, timingSafeEqual, generateSecureRoomCode } from '../services/crypto';
 
 export const adminRoutes = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
-// Helper to generate a random 6-character code
-function generateRoomCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 6; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length));
+// Helper: parse JSON body safely and return 400 on malformed
+async function parseBody(c: any): Promise<{ ok: true; body: any } | { ok: false }> {
+  try {
+    const body = await c.req.json();
+    return { ok: true, body };
+  } catch {
+    return { ok: false };
   }
-  return code;
 }
 
 // 1. Admin login endpoint (Publicly accessible)
+//    Issues a signed HMAC token — never returns the raw password.
 adminRoutes.post('/login', async (c) => {
   const requestId = c.get('requestId');
   const configuredPassword = c.env.ADMIN_PASSWORD || 'TM-OPERA_O';
 
-  let body: { password?: string };
-  try {
-    body = await c.req.json<{ password?: string }>();
-  } catch {
-    body = {};
-  }
-
-  if (body.password === configuredPassword) {
-    return c.json({
-      ok: true,
-      data: {
-        token: configuredPassword,
-        message: 'เข้าสู่ระบบสำเร็จ',
+  const parsed = await parseBody(c);
+  if (!parsed.ok) {
+    return c.json(
+      {
+        ok: false,
+        error: { code: 'INVALID_JSON', message: 'รูปแบบข้อมูลไม่ถูกต้อง' },
+        requestId,
       },
-      requestId,
-    });
+      400
+    );
   }
 
-  return c.json(
-    {
-      ok: false,
-      error: { code: 'INVALID_CREDENTIALS', message: 'รหัสผ่านไม่ถูกต้อง' },
-      requestId,
+  const { body } = parsed;
+
+  // Constant-time comparison to prevent timing attacks
+  if (!body.password || !timingSafeEqual(body.password, configuredPassword)) {
+    return c.json(
+      {
+        ok: false,
+        error: { code: 'INVALID_CREDENTIALS', message: 'รหัสผ่านไม่ถูกต้อง' },
+        requestId,
+      },
+      401
+    );
+  }
+
+  // Issue signed HMAC token (24h expiry), never return the raw password
+  const token = await signAdminToken(configuredPassword, 24);
+
+  return c.json({
+    ok: true,
+    data: {
+      token,
+      message: 'เข้าสู่ระบบสำเร็จ',
     },
-    401
-  );
+    requestId,
+  });
 });
 
 // Protect all following admin routes with adminAuthMiddleware
@@ -201,8 +214,15 @@ adminRoutes.get('/rooms/:id/details', async (c) => {
 // 5. Create a room
 adminRoutes.post('/rooms', async (c) => {
   const requestId = c.get('requestId');
-  const body = await c.req.json<CreateRoomRequest>();
+  const parsed = await parseBody(c);
+  if (!parsed.ok) {
+    return c.json(
+      { ok: false, error: { code: 'INVALID_JSON', message: 'รูปแบบข้อมูลไม่ถูกต้อง' }, requestId },
+      400
+    );
+  }
 
+  const body = parsed.body;
   if (!body.name || !body.name.trim()) {
     return c.json(
       {
@@ -214,14 +234,15 @@ adminRoutes.post('/rooms', async (c) => {
     );
   }
 
-  let code = generateRoomCode();
-  for (let i = 0; i < 5; i++) {
+  // Generate a cryptographically secure room code, ensure uniqueness
+  let code = generateSecureRoomCode();
+  for (let i = 0; i < 10; i++) {
     const existing = await c.env.DB
       .prepare('SELECT id FROM rooms WHERE code = ?')
       .bind(code)
       .first();
     if (!existing) break;
-    code = generateRoomCode();
+    code = generateSecureRoomCode();
   }
 
   const id = crypto.randomUUID();
@@ -262,8 +283,16 @@ adminRoutes.post('/rooms', async (c) => {
 adminRoutes.patch('/rooms/:id', async (c) => {
   const id = c.req.param('id');
   const requestId = c.get('requestId');
-  const body = await c.req.json<UpdateRoomRequest>();
 
+  const parsed = await parseBody(c);
+  if (!parsed.ok) {
+    return c.json(
+      { ok: false, error: { code: 'INVALID_JSON', message: 'รูปแบบข้อมูลไม่ถูกต้อง' }, requestId },
+      400
+    );
+  }
+
+  const body = parsed.body;
   const room = await getRoomById(c.env.DB, id);
   if (!room) {
     return c.json(
@@ -277,7 +306,8 @@ adminRoutes.patch('/rooms/:id', async (c) => {
   }
 
   const name = body.name?.trim() || room.name;
-  const status = body.status || room.status;
+  const validStatuses = ['open', 'closed', 'archived'];
+  const status = body.status && validStatuses.includes(body.status) ? body.status : room.status;
   const now = new Date().toISOString();
 
   await c.env.DB.prepare(`
@@ -306,10 +336,17 @@ adminRoutes.patch('/rooms/:id', async (c) => {
 adminRoutes.patch('/rooms/:id/settings', async (c) => {
   const id = c.req.param('id');
   const requestId = c.get('requestId');
-  const body = await c.req.json<Partial<RoomSettings>>();
+
+  const parsed = await parseBody(c);
+  if (!parsed.ok) {
+    return c.json(
+      { ok: false, error: { code: 'INVALID_JSON', message: 'รูปแบบข้อมูลไม่ถูกต้อง' }, requestId },
+      400
+    );
+  }
 
   try {
-    const updatedSettings = await updateRoomSettings(c.env, id, body);
+    const updatedSettings = await updateRoomSettings(c.env, id, parsed.body);
     return c.json({
       ok: true,
       data: { settings: updatedSettings },
@@ -327,7 +364,7 @@ adminRoutes.patch('/rooms/:id/settings', async (c) => {
   }
 });
 
-// 8. Rotate room code
+// 8. Rotate room code — generate cryptographically secure code, check uniqueness, broadcast
 adminRoutes.post('/rooms/:id/rotate-code', async (c) => {
   const id = c.req.param('id');
   const requestId = c.get('requestId');
@@ -344,7 +381,17 @@ adminRoutes.post('/rooms/:id/rotate-code', async (c) => {
     );
   }
 
-  const newCode = generateRoomCode();
+  // Ensure new code doesn't collide with any other room
+  let newCode = generateSecureRoomCode();
+  for (let i = 0; i < 10; i++) {
+    const existing = await c.env.DB
+      .prepare('SELECT id FROM rooms WHERE code = ? AND id != ?')
+      .bind(newCode, id)
+      .first();
+    if (!existing) break;
+    newCode = generateSecureRoomCode();
+  }
+
   const now = new Date().toISOString();
 
   await c.env.DB.prepare(`
@@ -354,6 +401,15 @@ adminRoutes.post('/rooms/:id/rotate-code', async (c) => {
   `).bind(newCode, now, id).run();
 
   const updatedRoom = { ...room, code: newCode, updated_at: now };
+
+  // Broadcast code rotation to OLD room's DO so connected players know to reconnect
+  // We send the updated room object (which contains the new code) so clients can redirect.
+  await broadcastToRoom(c.env, room.code, {
+    type: 'room.updated',
+    roomCode: room.code,
+    version: room.queue_version,
+    payload: { room: updatedRoom },
+  });
 
   return c.json({
     ok: true,
@@ -367,8 +423,16 @@ adminRoutes.post('/rooms/:id/songs/:songId/reorder', async (c) => {
   const id = c.req.param('id');
   const songId = c.req.param('songId');
   const requestId = c.get('requestId');
-  const body = await c.req.json<ReorderSongRequest>();
 
+  const parsed = await parseBody(c);
+  if (!parsed.ok) {
+    return c.json(
+      { ok: false, error: { code: 'INVALID_JSON', message: 'รูปแบบข้อมูลไม่ถูกต้อง' }, requestId },
+      400
+    );
+  }
+
+  const body = parsed.body;
   if (!body.direction || (body.direction !== 'up' && body.direction !== 'down')) {
     return c.json(
       {
@@ -403,8 +467,16 @@ adminRoutes.post('/rooms/:id/songs/:songId/reorder', async (c) => {
 adminRoutes.post('/rooms/:id/player/command', async (c) => {
   const id = c.req.param('id');
   const requestId = c.get('requestId');
-  const body = await c.req.json<PlayerCommandRequest>();
 
+  const parsed = await parseBody(c);
+  if (!parsed.ok) {
+    return c.json(
+      { ok: false, error: { code: 'INVALID_JSON', message: 'รูปแบบข้อมูลไม่ถูกต้อง' }, requestId },
+      400
+    );
+  }
+
+  const body = parsed.body;
   const room = await getRoomById(c.env.DB, id);
   if (!room) {
     return c.json(
@@ -414,6 +486,14 @@ adminRoutes.post('/rooms/:id/player/command', async (c) => {
         requestId,
       },
       404
+    );
+  }
+
+  const validCommands = ['pause', 'play', 'skip', 'start'];
+  if (!body.command || !validCommands.includes(body.command)) {
+    return c.json(
+      { ok: false, error: { code: 'INVALID_COMMAND', message: 'คำสั่งไม่ถูกต้อง' }, requestId },
+      400
     );
   }
 

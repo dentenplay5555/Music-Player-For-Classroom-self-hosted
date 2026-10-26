@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { useParams } from 'react-router-dom';
+import React, { useState, useEffect, useRef } from 'react';
+import { useParams, useSearchParams } from 'react-router-dom';
 import { Navbar } from '../components/Navbar';
 import { QRCodeDisplay } from '../components/QRCodeDisplay';
 import { YouTubePlayer } from '../components/YouTubePlayer';
@@ -18,10 +18,31 @@ import {
 
 export const PlayerPage: React.FC = () => {
   const { roomCode } = useParams<{ roomCode: string }>();
+  const [searchParams] = useSearchParams();
+
+  // Read player token from URL ?token=... and persist to localStorage once
+  const playerTokenInUrl = searchParams.get('token');
+  const hasPlayerToken = useRef(false);
+
+  useEffect(() => {
+    if (playerTokenInUrl && !hasPlayerToken.current) {
+      api.setPlayerToken(playerTokenInUrl);
+      hasPlayerToken.current = true;
+    }
+  }, [playerTokenInUrl]);
+
+  const canControl = Boolean(playerTokenInUrl || api.getPlayerToken());
+
   const [snapshot, setSnapshot] = useState<QueueSnapshot | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [playerState, setPlayerState] = useState<string>('Ready');
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
+
+  // Store playerState in a ref — so heartbeat always sends the latest value
+  // without adding it to useEffect dependency array (which caused WS reconnection storms).
+  const playerStateRef = useRef<string>('Ready');
+  const [playerStateDisplay, setPlayerStateDisplay] = useState<string>('Ready');
+
+  const ytRef = useRef<import('../components/YouTubePlayer').YouTubePlayerHandle>(null);
 
   const loadQueue = async () => {
     if (!roomCode) return;
@@ -33,23 +54,52 @@ export const PlayerPage: React.FC = () => {
     }
   };
 
-  const ytRef = React.useRef<import('../components/YouTubePlayer').YouTubePlayerHandle>(null);
+  const handleSongEnded = async () => {
+    if (!roomCode) return;
+    try {
+      await api.nextSong(roomCode);
+      loadQueue();
+    } catch (err) {
+      console.error('Failed to advance song:', err);
+    }
+  };
+
+  const handleManualSkip = async () => {
+    if (!roomCode || !snapshot?.playing) return;
+    try {
+      await api.nextSong(roomCode);
+      loadQueue();
+    } catch (err) {
+      console.error('Failed to skip song:', err);
+    }
+  };
+
+  // Track YouTube player state without causing WS reconnects
+  const handleStateChange = (state: string) => {
+    playerStateRef.current = state;
+    setPlayerStateDisplay(state);
+  };
 
   useEffect(() => {
     loadQueue();
-
     if (!roomCode) return;
 
-    // Send initial heartbeat and every 15 seconds
-    api.sendPlayerHeartbeat(roomCode, playerState).catch(() => {});
+    // Initial heartbeat + periodic (every 15 s)
+    api.sendPlayerHeartbeat(roomCode, playerStateRef.current).catch(() => {});
     const heartbeatTimer = setInterval(() => {
-      api.sendPlayerHeartbeat(roomCode, playerState).catch(() => {});
+      api.sendPlayerHeartbeat(roomCode, playerStateRef.current).catch(() => {});
     }, 15000);
 
+    // WebSocket — NOT in dependency array on playerState to avoid reconnect storm
     const cleanup = connectRoomWebSocket(
       roomCode,
       (msg) => {
-        if (msg.type === 'queue.updated' || msg.type === 'song.added' || msg.type === 'song.started' || msg.type === 'song.skipped') {
+        if (
+          msg.type === 'queue.updated' ||
+          msg.type === 'song.added' ||
+          msg.type === 'song.started' ||
+          msg.type === 'song.skipped'
+        ) {
           loadQueue();
         } else if (msg.type === 'player.command') {
           const cmd = (msg.payload as any)?.command;
@@ -71,7 +121,9 @@ export const PlayerPage: React.FC = () => {
       clearInterval(heartbeatTimer);
       cleanup();
     };
-  }, [roomCode, playerState]);
+    // Intentionally omit playerStateRef from deps — it's a ref, not reactive state
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomCode]);
 
   // Handle Fullscreen toggle
   const toggleFullscreen = () => {
@@ -83,33 +135,10 @@ export const PlayerPage: React.FC = () => {
   };
 
   useEffect(() => {
-    const onFsChange = () => {
-      setIsFullscreen(Boolean(document.fullscreenElement));
-    };
+    const onFsChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
     document.addEventListener('fullscreenchange', onFsChange);
     return () => document.removeEventListener('fullscreenchange', onFsChange);
   }, []);
-
-  // When YouTube player ends a video, tell server to advance queue
-  const handleSongEnded = async () => {
-    if (!roomCode) return;
-    try {
-      await api.nextSong(roomCode);
-      loadQueue();
-    } catch (err) {
-      console.error('Failed to advance song:', err);
-    }
-  };
-
-  const handleManualSkip = async () => {
-    if (!roomCode || !snapshot?.playing) return;
-    try {
-      await api.nextSong(roomCode);
-      loadQueue();
-    } catch (err) {
-      console.error('Failed to skip song:', err);
-    }
-  };
 
   const room = snapshot?.room;
   const currentSong = snapshot?.playing;
@@ -122,10 +151,14 @@ export const PlayerPage: React.FC = () => {
       <main className="flex-1 max-w-7xl mx-auto w-full p-4 lg:p-6 flex flex-col lg:flex-row gap-6">
         {/* Left Column: Player & Now Playing */}
         <div className="flex-1 flex flex-col gap-4">
-          {/* Top Bar for Fullscreen Controls & Room Info */}
+          {/* Top Bar */}
           <div className="flex items-center justify-between glass-panel px-4 py-2.5 rounded-xl border border-white/10">
             <div className="flex items-center gap-2.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-accent-green animate-pulse" />
+              <span
+                className={`w-2.5 h-2.5 rounded-full animate-pulse ${
+                  wsStatus === 'connected' ? 'bg-accent-green' : 'bg-yellow-500'
+                }`}
+              />
               <span className="font-bold text-sm text-white tracking-wide">
                 {room?.name || 'Classroom Player'}
               </span>
@@ -133,12 +166,13 @@ export const PlayerPage: React.FC = () => {
                 {roomCode}
               </span>
               <span className="text-[11px] text-slate-500 hidden sm:inline">
-                • {playerState}
+                • {playerStateDisplay}
               </span>
             </div>
 
             <div className="flex items-center gap-2">
-              {currentSong && (
+              {/* Only show skip button if this browser has a player token */}
+              {currentSong && canControl && (
                 <button
                   onClick={handleManualSkip}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-jukebox-surface hover:bg-jukebox-hover text-slate-300 hover:text-white text-xs transition-colors border border-white/10"
@@ -169,7 +203,7 @@ export const PlayerPage: React.FC = () => {
               ref={ytRef}
               videoId={currentSong?.video_id || null}
               onEnded={handleSongEnded}
-              onStateChange={setPlayerState}
+              onStateChange={handleStateChange}
             />
           </div>
 

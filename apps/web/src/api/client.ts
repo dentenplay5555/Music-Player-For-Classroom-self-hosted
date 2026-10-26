@@ -10,6 +10,18 @@ import {
 
 const API_BASE = '/api/v1';
 
+// --- Persistent client ID (UUID stored in localStorage) ---
+// Used for per-device rate limiting instead of IP-based buckets.
+function getClientId(): string {
+  const key = 'qr_music_client_id';
+  let id = localStorage.getItem(key);
+  if (!id || id.length < 8) {
+    id = crypto.randomUUID();
+    localStorage.setItem(key, id);
+  }
+  return id;
+}
+
 export class ApiError extends Error {
   code: string;
   requestId?: string;
@@ -23,13 +35,21 @@ export class ApiError extends Error {
 
 async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
   const token = localStorage.getItem('qr_music_admin_token');
+  const playerToken = localStorage.getItem('qr_music_player_token');
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    'x-client-id': getClientId(),
     ...(options.headers as Record<string, string>),
   };
 
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  // Attach player token for player-authenticated routes
+  if (playerToken) {
+    headers['x-player-token'] = playerToken;
   }
 
   const res = await fetch(`${API_BASE}${endpoint}`, {
@@ -53,6 +73,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ youtubeUrl, requestId: crypto.randomUUID() }),
     }),
+
+  // Player-only (require player token stored in localStorage)
   nextSong: (code: string) =>
     request<{ previousSong: Song | null; nextSong: Song | null; queueVersion: number }>(
       `/rooms/${code}/player/next`,
@@ -63,6 +85,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ status }),
     }),
+
+  // Player token management
+  setPlayerToken: (token: string) => {
+    localStorage.setItem('qr_music_player_token', token);
+  },
+  clearPlayerToken: () => {
+    localStorage.removeItem('qr_music_player_token');
+  },
+  getPlayerToken: (): string | null => localStorage.getItem('qr_music_player_token'),
 
   // Admin
   adminLogin: async (password: string) => {
@@ -147,7 +178,6 @@ export function connectRoomWebSocket(
     if (isClosedManually) return;
     onStatusChange?.('connecting');
 
-    // Protocol: ws:// or wss:// depending on window.location
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
     const wsUrl = `${protocol}//${host}/api/v1/rooms/${roomCode}/ws`;
@@ -158,7 +188,6 @@ export function connectRoomWebSocket(
       ws.onopen = () => {
         reconnectAttempts = 0;
         onStatusChange?.('connected');
-        // Send hello
         ws?.send(JSON.stringify({ type: 'client.hello', lastSeenVersion: 0 }));
       };
 
