@@ -23,8 +23,24 @@ export const QRCodeDisplay: React.FC<QRCodeDisplayProps> = ({
   const base = publicUrl ? publicUrl.replace(/\/+$/, '') : window.location.origin;
   const requestUrl = `${base}/r/${roomCode}`;
 
-  const copyToClipboard = () => {
-    navigator.clipboard.writeText(requestUrl);
+  const copyToClipboard = async () => {
+    // navigator.clipboard is undefined on plain-HTTP LAN IPs (insecure context), so fall back.
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(requestUrl);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = requestUrl;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+    } catch {
+      return;
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };

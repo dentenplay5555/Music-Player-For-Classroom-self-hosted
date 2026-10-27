@@ -10,13 +10,39 @@ import {
 
 const API_BASE = '/api/v1';
 
+// crypto.randomUUID() exists only in secure contexts (HTTPS or localhost).
+// When the app is opened via a LAN IP over plain HTTP (e.g. http://192.168.1.143:5173)
+// it is undefined and calling it throws, which broke every API request (including admin login).
+// crypto.getRandomValues() is available in all contexts, so use it as a fallback.
+function uuid(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+  bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0'));
+  return (
+    hex.slice(0, 4).join('') + '-' +
+    hex.slice(4, 6).join('') + '-' +
+    hex.slice(6, 8).join('') + '-' +
+    hex.slice(8, 10).join('') + '-' +
+    hex.slice(10, 16).join('')
+  );
+}
+
 // --- Persistent client ID (UUID stored in localStorage) ---
 // Used for per-device rate limiting instead of IP-based buckets.
 function getClientId(): string {
   const key = 'qr_music_client_id';
   let id = localStorage.getItem(key);
   if (!id || id.length < 8) {
-    id = crypto.randomUUID();
+    id = uuid();
     localStorage.setItem(key, id);
   }
   return id;
@@ -71,7 +97,7 @@ export const api = {
   addSong: (code: string, youtubeUrl: string) =>
     request<AddSongResponseData>(`/rooms/${code}/songs`, {
       method: 'POST',
-      body: JSON.stringify({ youtubeUrl, requestId: crypto.randomUUID() }),
+      body: JSON.stringify({ youtubeUrl, requestId: uuid() }),
     }),
 
   // Player-only (require player token stored in localStorage)

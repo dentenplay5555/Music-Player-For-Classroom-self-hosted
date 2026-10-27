@@ -150,7 +150,8 @@ export const AdminPage: React.FC = () => {
       if (err instanceof ApiError) {
         setLoginError(err.message);
       } else {
-        setLoginError('รหัสผ่านไม่ถูกต้อง');
+        console.error('Admin login failed:', err);
+        setLoginError('เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ หรือเกิดข้อผิดพลาดบนเบราว์เซอร์ (ดู Console)');
       }
     }
   };
